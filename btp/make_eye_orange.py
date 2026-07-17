@@ -17,9 +17,8 @@ from PIL import Image
 
 def is_eye_blue(arr: np.ndarray) -> np.ndarray:
     """
-    Detect iris / eye-fill blue (incl. mid & light cyan).
-    Near-black deep navy (pupil rim) is kept unchanged.
-    Broader than the transparent-key mask so the eyeball stays complete.
+    Detect all iris blues: bright cyan, mid blue, and dark navy rim.
+    Pure black / warm-brown eyelids are left alone.
     """
     r = arr[:, :, 0].astype(np.int16)
     g = arr[:, :, 1].astype(np.int16)
@@ -39,15 +38,28 @@ def is_eye_blue(arr: np.ndarray) -> np.ndarray:
     hue[mask_g] = (60.0 * (((bf - rf) / diff) + 2.0))[mask_g]
     hue[mask_b] = (60.0 * (((rf - gf) / diff) + 4.0))[mask_b]
 
-    is_blue_hue = (hue >= 170.0) & (hue <= 240.0)
-    is_eye = is_blue_hue & (
-        ((sat > 0.15) & (mx > 80.0))
-        | ((bf > 170.0) & (gf > 150.0) & (rf < gf) & ((bf - rf) > 15.0) & (sat > 0.04))
+    # Mid / bright iris fill
+    is_blue_hue = (hue >= 165.0) & (hue <= 250.0)
+    is_fill = is_blue_hue & (
+        ((sat > 0.12) & (mx > 70.0))
+        | ((bf > 160.0) & (gf > 140.0) & (rf < gf) & ((bf - rf) > 12.0) & (sat > 0.03))
     )
-    is_eye = is_eye & ~((sat < 0.10) & (mx < 150.0))
+
+    # Dark navy / indigo / cool-purple pupil rim
+    is_dark_navy = (
+        (bf >= rf - 2)
+        & (bf >= gf - 12)
+        & (bf >= 22)
+        & (mx <= 145)
+        & (mx >= 15)
+        & (rf < 110)
+        & ((bf > rf + 3) | ((sat > 0.05) & (bf >= rf)))
+    )
+
+    is_eye = is_fill | is_dark_navy
     is_eye = is_eye & ~((r > 230) & (g > 240) & (b > 240))
-    # Keep near-black deep navy
-    is_eye = is_eye & (mx >= 90.0) & (bf >= 95.0)
+    # Skip warm-dark eyelid browns (clearly R-led, not cool/blue)
+    is_eye = is_eye & ~((rf > bf + 4) & (rf >= gf) & (mx < 80))
     return is_eye
 
 
@@ -61,8 +73,8 @@ def load_colormap(path: Path, size: tuple[int, int]) -> np.ndarray:
 
 def replace_blue_with_colormap(frame: Image.Image, colormap: np.ndarray) -> Image.Image:
     """
-    For each eye-blue pixel, sample orange-gold from colormap at the same (x, y),
-    then modulate by the original blue luminance so highlights/shadows remain.
+    Replace eye-blue with orange-gold.
+    Dark navy → deep brown, mid → orange, bright → gold (黑→棕→橘→金).
     """
     arr = np.asarray(frame.convert("RGBA"), dtype=np.uint8).copy()
     h, w = arr.shape[:2]
@@ -74,14 +86,24 @@ def replace_blue_with_colormap(frame: Image.Image, colormap: np.ndarray) -> Imag
         return Image.fromarray(arr, "RGBA")
 
     src = arr[mask, :3].astype(np.float32)
-    # Perceived luminance of original blue (preserves bright cyan vs darker fill)
     lum = 0.299 * src[:, 0] + 0.587 * src[:, 1] + 0.114 * src[:, 2]
-    # Normalize around typical iris blue brightness
-    factor = np.clip(lum / 160.0, 0.55, 1.35)
-
     mapped = colormap[mask].astype(np.float32)
-    out_rgb = np.clip(mapped * factor[:, None], 0, 255).astype(np.uint8)
-    arr[mask, :3] = out_rgb
+
+    # 0 = shadow brown, 1+ = full gold from colour map
+    t = np.clip(lum / 150.0, 0.0, 1.25)
+    brown = np.array([78.0, 38.0, 10.0], dtype=np.float32)
+    brown_w = np.clip(1.0 - t / 0.55, 0.0, 1.0)[:, None]
+
+    factor = np.clip(0.12 + t * 0.95, 0.10, 1.40)[:, None]
+    warm = mapped * factor
+    out_rgb = warm * (1.0 - brown_w * 0.92) + brown * (brown_w * 0.92)
+    out_rgb *= np.clip(lum / 100.0, 0.25, 1.15)[:, None]
+
+    # Kill residual blue cast — keep warm R≥B
+    out_rgb[:, 2] = np.minimum(out_rgb[:, 2], out_rgb[:, 0] * 0.55)
+    out_rgb[:, 1] = np.minimum(out_rgb[:, 1], out_rgb[:, 0] * 0.85 + 20.0)
+
+    arr[mask, :3] = np.clip(out_rgb, 0, 255).astype(np.uint8)
     return Image.fromarray(arr, "RGBA")
 
 
