@@ -23,7 +23,10 @@ TRANSPARENT_INDEX = 255
 
 
 def is_eye_blue(arr: np.ndarray) -> np.ndarray:
-    """Return boolean mask for iris / eye-fill blue (and light cyan) pixels."""
+    """
+    Iris / eye-fill blue (and light cyan) → transparent.
+    Near-black deep navy (pupil rim / shadow) is kept.
+    """
     r = arr[:, :, 0].astype(np.int16)
     g = arr[:, :, 1].astype(np.int16)
     b = arr[:, :, 2].astype(np.int16)
@@ -43,126 +46,16 @@ def is_eye_blue(arr: np.ndarray) -> np.ndarray:
     hue[mask_b] = (60.0 * (((rf - gf) / diff) + 4.0))[mask_b]
 
     is_blue_hue = (hue >= 170.0) & (hue <= 240.0)
-    # Include darker navy blues inside the pupil fill; outline is restored later.
+    # Brighter fill / cyan only — raised brightness floor vs earlier mx>70
     is_eye = is_blue_hue & (
-        ((sat > 0.15) & (mx > 55.0))
+        ((sat > 0.18) & (mx > 125.0) & (bf >= 130.0))
         | ((bf > 180.0) & (gf > 160.0) & (rf < gf) & ((bf - rf) > 20.0) & (sat > 0.05))
     )
     is_eye = is_eye & ~((sat < 0.12) & (mx < 160.0))
     is_eye = is_eye & ~((r > 230) & (g > 240) & (b > 240))
-    # Keep near-black pupil body (not blue fill)
-    is_eye = is_eye & ~((r + g + b) < 70)
+    # Keep near-black / deep navy (e.g. 25,69,108 / 15,32,79)
+    is_eye = is_eye & (mx >= 125.0) & (bf >= 130.0)
     return is_eye
-
-
-def _binary_dilate(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
-    out = mask.astype(bool)
-    for _ in range(iterations):
-        grown = out.copy()
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dy == 0 and dx == 0:
-                    continue
-                grown |= np.roll(np.roll(out, dy, axis=0), dx, axis=1)
-        out = grown
-    return out
-
-
-def _binary_erode(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
-    out = mask.astype(bool)
-    for _ in range(iterations):
-        shrunk = out.copy()
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dy == 0 and dx == 0:
-                    continue
-                shrunk &= np.roll(np.roll(out, dy, axis=0), dx, axis=1)
-        out = shrunk
-    return out
-
-
-def _binary_close(mask: np.ndarray, iterations: int = 2) -> np.ndarray:
-    return _binary_erode(_binary_dilate(mask, iterations), iterations)
-
-
-def _pupil_silhouette(arr: np.ndarray) -> np.ndarray:
-    """
-    Approximate pupil discs before keying so we can restore their outline.
-    Takes dark / navy pixels that sit inside the blue eye area (not brown lids).
-    """
-    r = arr[:, :, 0].astype(np.int16)
-    g = arr[:, :, 1].astype(np.int16)
-    b = arr[:, :, 2].astype(np.int16)
-    a = arr[:, :, 3]
-    lum = r.astype(np.int32) + g.astype(np.int32) + b.astype(np.int32)
-    opaque = a >= 128
-    highlight = (r > 200) & (g > 200) & (b > 200)
-
-    blue = is_eye_blue(arr)
-    # Grow blue inward over the pupil; stay away from brown eyelids (r >> b)
-    inside_eye = _binary_dilate(blue, 8)
-    seed = (
-        opaque
-        & ~highlight
-        & inside_eye
-        & (lum < 300)
-        & (b >= r - 5)  # navy/black pupil, not reddish-brown lid
-        & (r < 140)
-    )
-    # Fill holes left by specular highlights
-    return _binary_close(seed, 3)
-
-
-def _restore_pupil_outline(arr: np.ndarray, pupil_mask: np.ndarray) -> np.ndarray:
-    """
-    After keying blues, put back a dark rim so pupils stay complete circles.
-    Interior blues may stay transparent; only the contour is restored.
-    """
-    if not pupil_mask.any():
-        return arr
-
-    # Rim = pupil area minus its erosion (1-2px ring)
-    rim = pupil_mask & ~_binary_erode(pupil_mask, 2)
-    # Also heal single-pixel notches just inside the rim
-    near_rim = _binary_dilate(rim, 1) & pupil_mask
-
-    need = near_rim & (arr[:, :, 3] < 128)
-    if not need.any():
-        return arr
-
-    # Sample a dark color from remaining pupil body (fallback to near-black)
-    body = pupil_mask & (arr[:, :, 3] >= 128)
-    if body.any():
-        # Prefer darker remaining pixels for outline color
-        lum = (
-            arr[:, :, 0].astype(np.int32)
-            + arr[:, :, 1].astype(np.int32)
-            + arr[:, :, 2].astype(np.int32)
-        )
-        body_dark = body & (lum < 120)
-        sample = body_dark if body_dark.any() else body
-        ys, xs = np.where(sample)
-        # median of a subset for stability
-        idx = np.linspace(0, len(ys) - 1, num=min(64, len(ys)), dtype=int)
-        color = np.median(arr[ys[idx], xs[idx], :3], axis=0).astype(np.uint8)
-    else:
-        color = np.array([20, 14, 18], dtype=np.uint8)
-
-    arr = arr.copy()
-    arr[need, 0] = color[0]
-    arr[need, 1] = color[1]
-    arr[need, 2] = color[2]
-    arr[need, 3] = 255
-    return arr
-
-
-def key_blue_to_transparent(frame: Image.Image) -> Image.Image:
-    """Key eye-blue to transparent, but keep pupil circular outlines intact."""
-    arr = np.asarray(frame.convert("RGBA")).copy()
-    pupil = _pupil_silhouette(arr)
-    arr[is_eye_blue(arr), 3] = 0
-    arr = _restore_pupil_outline(arr, pupil)
-    return _binarize_alpha(Image.fromarray(arr, "RGBA"))
 
 
 def _quantize_for_gif(
@@ -292,6 +185,13 @@ def _finalize_frames(frames: list[Image.Image]) -> list[Image.Image]:
         palette = list(frame.getpalette() or [])
         out.append(_p_image_from(np.asarray(frame, dtype=np.uint8), palette))
     return out
+
+
+def key_blue_to_transparent(frame: Image.Image) -> Image.Image:
+    """Make eye-blue pixels fully transparent on an RGBA frame."""
+    arr = np.asarray(frame.convert("RGBA")).copy()
+    arr[is_eye_blue(arr), 3] = 0
+    return _binarize_alpha(Image.fromarray(arr, "RGBA"))
 
 
 def process_gif(src: Path, dst: Path) -> dict:
